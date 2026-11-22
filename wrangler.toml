@@ -1,4 +1,4 @@
-name = "office-hours-queue"
+name = "ohq-groups"
 compatibility_date = "2025-01-01"
 compatibility_flags = ["nodejs_compat", "assets_navigation_has_no_effect"]
 main = "worker.ts"
@@ -28,7 +28,7 @@ run_worker_first = ["/api/*", "/ws/*", "/internal/*", "/v1/*", "/_deepspace/*", 
 # secrets, and collaborators all key to it. Renames are safe.
 [vars]
 DEEPSPACE_APP_ID = "app_01M828DGGZWPZTTZS2XYV4FQT4"
-APP_NAME = "office-hours-queue"
+APP_NAME = "ohq-groups"
 # Exact comma-separated native callback URIs. Set this before deploying an
 # Expo client, for example: "myapp://auth/callback".
 NATIVE_AUTH_REDIRECT_URIS = ""
