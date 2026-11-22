@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import { useUser, useMutations, useQuery, AuthGate, AuthOverlay } from 'deepspace'
+import { useUser, useMutations, useQuery, AuthGate, AuthOverlay, getAuthToken } from 'deepspace'
 import { Button } from '@/components/ui/Button'
 import { Input } from '@/components/ui/Input'
 
@@ -39,16 +39,21 @@ function SignInPrompt() {
 }
 
 function Queue() {
-  const { user } = useUser()
-  const { records: entries } = useQuery<QueueEntryData>('queue_entries', {
-    where: { status: 'waiting' },
+  const { user, refetch: refetchUser } = useUser()
+  const isTA = user?.role === 'admin'
+
+  // All entries — filter client-side so both student and TA views share one subscription
+  const { records: allEntries } = useQuery<QueueEntryData>('queue_entries', {
     orderBy: 'createdAt',
     orderDir: 'asc',
   })
-  const { create, remove, ready } = useMutations<QueueEntryData>('queue_entries')
-  const [question, setQuestion] = useState('')
+  const { put, create, remove, ready } = useMutations<QueueEntryData>('queue_entries')
 
-  const myEntry = entries.find((e) => e.createdBy === user?.id)
+  const waitingEntries = allEntries.filter((e) => e.data.status === 'waiting')
+  const myEntry = allEntries.find((e) => e.createdBy === user?.id)
+
+  // Student join form state
+  const [question, setQuestion] = useState('')
 
   async function handleJoin(e: React.FormEvent) {
     e.preventDefault()
@@ -57,11 +62,36 @@ function Queue() {
     setQuestion('')
   }
 
+  // TA action handlers
+  async function handleClaim(entryId: string) {
+    await put(entryId, {
+      status: 'claimed',
+      claimedBy: user?.id ?? null,
+      claimedAt: new Date().toISOString(),
+    })
+  }
+
+  async function handleResolve(entryId: string) {
+    await put(entryId, { status: 'resolved', resolvedAt: new Date().toISOString() })
+  }
+
+  async function handleRequeue(entryId: string) {
+    await put(entryId, { status: 'waiting', claimedBy: null, claimedAt: null })
+  }
+
   return (
     <div className="mx-auto max-w-2xl px-6 py-8 text-foreground">
       <h1 className="mb-6 text-2xl font-semibold">Office Hours Queue</h1>
 
-      {!myEntry && (
+      {/* Student: status of own entry */}
+      {!isTA && myEntry && myEntry.data.status === 'claimed' && (
+        <div className="mb-6 rounded-lg border border-border bg-card px-4 py-3 text-sm text-foreground">
+          A TA is coming — hang tight!
+        </div>
+      )}
+
+      {/* Student: join form (hidden once in queue) */}
+      {!isTA && !myEntry && (
         <form onSubmit={handleJoin} className="mb-8 flex gap-2">
           <Input
             value={question}
@@ -76,17 +106,12 @@ function Queue() {
         </form>
       )}
 
-      {myEntry && (
-        <div className="mb-8 rounded-lg border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
-          You&apos;re in the queue. Leave any time with the button on your entry below.
-        </div>
-      )}
-
-      {entries.length === 0 ? (
-        <p className="text-sm text-muted-foreground">The queue is empty — join to be first!</p>
+      {/* Queue list */}
+      {waitingEntries.length === 0 ? (
+        <p className="text-sm text-muted-foreground">The queue is empty.</p>
       ) : (
         <ul className="space-y-2">
-          {entries.map((entry, i) => {
+          {waitingEntries.map((entry, i) => {
             const isOwn = entry.createdBy === user?.id
             return (
               <li
@@ -97,21 +122,169 @@ function Queue() {
                   #{i + 1}
                 </span>
                 <span className="flex-1 text-sm text-foreground">{entry.data.question}</span>
-                {isOwn && (
-                  <Button
-                    variant="secondary"
-                    size="sm"
-                    onClick={() => remove(entry.recordId)}
-                    disabled={!ready}
-                  >
-                    Leave
-                  </Button>
+                {isTA ? (
+                  <div className="flex shrink-0 gap-1">
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => handleClaim(entry.recordId)}
+                      disabled={!ready}
+                    >
+                      Claim
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => handleResolve(entry.recordId)}
+                      disabled={!ready}
+                    >
+                      Resolve
+                    </Button>
+                  </div>
+                ) : (
+                  isOwn && (
+                    <Button
+                      variant="secondary"
+                      size="sm"
+                      onClick={() => remove(entry.recordId)}
+                      disabled={!ready}
+                    >
+                      Leave
+                    </Button>
+                  )
                 )}
               </li>
             )
           })}
         </ul>
       )}
+
+      {/* TA: claimed entries with Resolve / Requeue */}
+      {isTA && (
+        <ClaimedSection
+          allEntries={allEntries}
+          ready={ready}
+          onResolve={handleResolve}
+          onRequeue={handleRequeue}
+        />
+      )}
+
+      {/* TA join code form (shown to non-TA signed-in users) */}
+      {!isTA && <TaCodeForm onSuccess={refetchUser} />}
     </div>
+  )
+}
+
+function ClaimedSection({
+  allEntries,
+  ready,
+  onResolve,
+  onRequeue,
+}: {
+  allEntries: ReturnType<typeof useQuery<QueueEntryData>>['records']
+  ready: boolean
+  onResolve: (id: string) => void
+  onRequeue: (id: string) => void
+}) {
+  const claimed = allEntries.filter((e) => e.data.status === 'claimed')
+  if (claimed.length === 0) return null
+  return (
+    <div className="mt-8">
+      <h2 className="mb-3 text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+        Claimed
+      </h2>
+      <ul className="space-y-2">
+        {claimed.map((entry) => (
+          <li
+            key={entry.recordId}
+            className="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3"
+          >
+            <span className="flex-1 text-sm text-foreground">{entry.data.question}</span>
+            <div className="flex shrink-0 gap-1">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => onResolve(entry.recordId)}
+                disabled={!ready}
+              >
+                Resolve
+              </Button>
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => onRequeue(entry.recordId)}
+                disabled={!ready}
+              >
+                Requeue
+              </Button>
+            </div>
+          </li>
+        ))}
+      </ul>
+    </div>
+  )
+}
+
+function TaCodeForm({ onSuccess }: { onSuccess: () => Promise<void> }) {
+  const [code, setCode] = useState('')
+  const [state, setState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    if (!code.trim() || state === 'loading') return
+    setState('loading')
+
+    try {
+      const jwt = await getAuthToken()
+      const res = await fetch('/api/actions/redeemTaCode', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
+        },
+        body: JSON.stringify({ code: code.trim() }),
+      })
+      const data = (await res.json()) as { success?: boolean }
+      if (data.success) {
+        setCode('')
+        await onSuccess()
+        setState('done')
+        return
+      }
+      setState('error')
+    } catch {
+      setState('error')
+    }
+
+    setCode('')
+    // Reset feedback after a moment so repeated attempts don't reveal info
+    setTimeout(() => setState('idle'), 2000)
+  }
+
+  if (state === 'done') return null
+
+  return (
+    <details className="mt-10">
+      <summary className="cursor-pointer text-sm text-muted-foreground hover:text-foreground">
+        I&apos;m a TA
+      </summary>
+      <form onSubmit={handleSubmit} className="mt-3 flex gap-2">
+        <Input
+          type="password"
+          value={code}
+          onChange={(e) => setCode(e.target.value)}
+          placeholder="Enter TA code"
+          disabled={state === 'loading'}
+          className="flex-1"
+          autoComplete="off"
+        />
+        <Button type="submit" disabled={state === 'loading' || !code.trim()}>
+          {state === 'loading' ? 'Checking…' : 'Submit'}
+        </Button>
+      </form>
+      {state === 'error' && (
+        <p className="mt-2 text-xs text-muted-foreground">Code not recognised.</p>
+      )}
+    </details>
   )
 }

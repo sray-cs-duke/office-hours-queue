@@ -118,6 +118,7 @@ export interface Env extends DOBindings<typeof __DO_MANIFEST__> {
    * an authenticated app owner/admin. deepspace dev/test set it locally.
    */
   ALLOW_DEBUG_ROUTES?: string
+  TA_JOIN_CODE?: string
 }
 
 export type AppContext = { Bindings: Env }
