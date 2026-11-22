@@ -15,8 +15,7 @@ export const groupSuggestionsSchema: CollectionSchema = {
   ],
   permissions: {
     '*': { read: false, create: false, update: false, delete: false },
-    // AI creates these server-side via APP_OWNER_JWT, which bypasses RBAC
     member: { read: false, create: false, update: false, delete: false },
-    admin: { read: true, create: false, update: true, delete: true },
+    admin: { read: true, create: true, update: true, delete: true },
   },
 }

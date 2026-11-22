@@ -12,6 +12,24 @@ type QueueEntryData = {
   resolvedAt?: string | null
 }
 
+type GroupSuggestionData = {
+  entryIds: string[] | string
+  reason: string
+  status?: string
+  confirmedBy?: string | null
+}
+
+type QueueRecord = ReturnType<typeof useQuery<QueueEntryData>>['records'][number]
+type SuggestionRecord = ReturnType<typeof useQuery<GroupSuggestionData>>['records'][number]
+
+type QueueItem =
+  | { kind: 'solo'; entry: QueueRecord }
+  | { kind: 'group'; groupId: string; entries: QueueRecord[]; reason: string }
+
+function parseEntryIds(raw: string[] | string): string[] {
+  return Array.isArray(raw) ? raw : JSON.parse(raw as string)
+}
+
 export default function QueuePage() {
   return (
     <AuthGate fallback={<SignInPrompt />}>
@@ -42,15 +60,57 @@ function Queue() {
   const { user, refetch: refetchUser } = useUser()
   const isTA = user?.role === 'admin'
 
-  // All entries — filter client-side so both student and TA views share one subscription
   const { records: allEntries } = useQuery<QueueEntryData>('queue_entries', {
     orderBy: 'createdAt',
     orderDir: 'asc',
   })
   const { put, create, remove, ready } = useMutations<QueueEntryData>('queue_entries')
 
+  const { records: allSuggestions } = useQuery<GroupSuggestionData>('group_suggestions', {
+    orderBy: 'createdAt',
+    orderDir: 'asc',
+  })
+  const { put: putSuggestion } = useMutations<GroupSuggestionData>('group_suggestions')
+
   const waitingEntries = allEntries.filter((e) => e.data.status === 'waiting')
-  const myEntry = allEntries.find((e) => e.createdBy === user?.id)
+  const myEntry = allEntries.find(
+    (e) => e.createdBy === user?.id && (e.data.status === 'waiting' || e.data.status === 'claimed'),
+  )
+  const pendingSuggestions = allSuggestions.filter((s) => s.data.status === 'pending')
+
+  // groupId (= confirmed suggestion recordId) → reason
+  const groupReasons = new Map<string, string>()
+  for (const s of allSuggestions) {
+    if (s.data.status === 'confirmed') groupReasons.set(s.recordId, s.data.reason)
+  }
+
+  // Build ordered list of solo entries and group cards
+  const addedGroups = new Set<string>()
+  const addedEntries = new Set<string>()
+  const queueItems: QueueItem[] = []
+  for (const entry of waitingEntries) {
+    if (addedEntries.has(entry.recordId)) continue
+    if (entry.data.groupId) {
+      const gid = entry.data.groupId
+      if (!addedGroups.has(gid)) {
+        addedGroups.add(gid)
+        const members = waitingEntries.filter((e) => e.data.groupId === gid)
+        for (const m of members) addedEntries.add(m.recordId)
+        queueItems.push({ kind: 'group', groupId: gid, entries: members, reason: groupReasons.get(gid) ?? '' })
+      }
+    } else {
+      addedEntries.add(entry.recordId)
+      queueItems.push({ kind: 'solo', entry })
+    }
+  }
+
+  // Student: how many others share their group
+  const myGroupOthers =
+    myEntry?.data.groupId
+      ? waitingEntries.filter(
+          (e) => e.data.groupId === myEntry.data.groupId && e.recordId !== myEntry.recordId,
+        ).length
+      : 0
 
   // Student join form state
   const [question, setQuestion] = useState('')
@@ -62,7 +122,7 @@ function Queue() {
     setQuestion('')
   }
 
-  // TA action handlers
+  // TA: queue entry handlers
   async function handleClaim(entryId: string) {
     await put(entryId, {
       status: 'claimed',
@@ -79,18 +139,110 @@ function Queue() {
     await put(entryId, { status: 'waiting', claimedBy: null, claimedAt: null })
   }
 
+  // TA: group handlers
+  async function handleClaimGroup(entries: QueueRecord[]) {
+    await Promise.all(
+      entries.map((e) =>
+        put(e.recordId, {
+          status: 'claimed',
+          claimedBy: user?.id ?? null,
+          claimedAt: new Date().toISOString(),
+        }),
+      ),
+    )
+  }
+
+  async function handleResolveGroup(entries: QueueRecord[]) {
+    await Promise.all(
+      entries.map((e) => put(e.recordId, { status: 'resolved', resolvedAt: new Date().toISOString() })),
+    )
+  }
+
+  async function handleRemoveFromGroup(entryId: string) {
+    await put(entryId, { groupId: null })
+  }
+
+  // TA: AI suggestions
+  const [suggestState, setSuggestState] = useState<'idle' | 'loading' | 'empty' | 'error'>('idle')
+
+  async function handleSuggestGroups() {
+    setSuggestState('loading')
+    const timeout = new Promise<never>((_, reject) =>
+      setTimeout(() => reject(new Error('timeout')), 30_000),
+    )
+    try {
+      const jwt = await getAuthToken()
+      const res = await Promise.race([
+        fetch('/api/actions/suggestGroups', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            ...(jwt ? { Authorization: `Bearer ${jwt}` } : {}),
+          },
+          body: JSON.stringify({}),
+        }),
+        timeout,
+      ])
+      const data = (await res.json()) as { success?: boolean; data?: { count?: number }; error?: string }
+      console.log('[suggestGroups UI] response:', data)
+      if (data.success && (data.data?.count ?? 0) === 0) {
+        setSuggestState('empty')
+        setTimeout(() => setSuggestState('idle'), 3000)
+      } else {
+        setSuggestState('idle')
+      }
+    } catch (err) {
+      console.log('[suggestGroups UI] fetch error or timeout:', err)
+      setSuggestState('error')
+      setTimeout(() => setSuggestState('idle'), 3000)
+    }
+  }
+
+  async function handleConfirmSuggestion(suggestion: SuggestionRecord) {
+    const ids = parseEntryIds(suggestion.data.entryIds)
+    const stillWaiting = ids.filter((id) =>
+      allEntries.find((e) => e.recordId === id)?.data.status === 'waiting',
+    )
+
+    if (stillWaiting.length < 2) {
+      await putSuggestion(suggestion.recordId, { status: 'dismissed' })
+      return
+    }
+
+    const groupId = suggestion.recordId
+    await Promise.all(stillWaiting.map((id) => put(id, { groupId })))
+    await putSuggestion(suggestion.recordId, {
+      status: 'confirmed',
+      confirmedBy: user?.id ?? null,
+    })
+  }
+
+  async function handleDismissSuggestion(suggestionId: string) {
+    await putSuggestion(suggestionId, { status: 'dismissed' })
+  }
+
+  const ungroupedWaiting = waitingEntries.filter((e) => !e.data.groupId).length
+
   return (
     <div className="mx-auto max-w-2xl px-6 py-8 text-foreground">
       <h1 className="mb-6 text-2xl font-semibold">Office Hours Queue</h1>
 
-      {/* Student: status of own entry */}
-      {!isTA && myEntry && myEntry.data.status === 'claimed' && (
+      {/* Student: claimed banner */}
+      {!isTA && myEntry?.data.status === 'claimed' && (
         <div className="mb-6 rounded-lg border border-border bg-card px-4 py-3 text-sm text-foreground">
           A TA is coming — hang tight!
         </div>
       )}
 
-      {/* Student: join form (hidden once in queue) */}
+      {/* Student: grouped banner */}
+      {!isTA && myEntry?.data.groupId && myGroupOthers > 0 && (
+        <div className="mb-4 rounded-lg border border-border bg-card px-4 py-3 text-sm text-foreground">
+          You&apos;re in a group with {myGroupOthers}{' '}
+          {myGroupOthers === 1 ? 'other' : 'others'} with the same issue.
+        </div>
+      )}
+
+      {/* Student: join form */}
       {!isTA && !myEntry && (
         <form onSubmit={handleJoin} className="mb-8 flex gap-2">
           <Input
@@ -106,28 +258,61 @@ function Queue() {
         </form>
       )}
 
+      {/* TA: suggest groups button */}
+      {isTA && (
+        <div className="mb-4 flex items-center justify-between">
+          <span className="text-sm text-muted-foreground">
+            {suggestState === 'empty'
+              ? 'No similar questions right now.'
+              : suggestState === 'error'
+                ? 'Something went wrong — try again.'
+                : pendingSuggestions.length > 0
+                  ? `${pendingSuggestions.length} pending suggestion${pendingSuggestions.length > 1 ? 's' : ''}`
+                  : ''}
+          </span>
+          <Button
+            variant="secondary"
+            size="sm"
+            onClick={handleSuggestGroups}
+            disabled={suggestState === 'loading' || ungroupedWaiting < 2 || !ready}
+          >
+            {suggestState === 'loading' ? 'Thinking…' : 'Suggest groups'}
+          </Button>
+        </div>
+      )}
+
+      {/* TA: pending AI suggestions */}
+      {isTA && pendingSuggestions.length > 0 && (
+        <SuggestionsPanel
+          suggestions={pendingSuggestions}
+          allEntries={allEntries}
+          ready={ready}
+          onConfirm={handleConfirmSuggestion}
+          onDismiss={handleDismissSuggestion}
+        />
+      )}
+
       {/* Queue list */}
-      {waitingEntries.length === 0 ? (
+      {queueItems.length === 0 ? (
         <p className="text-sm text-muted-foreground">The queue is empty.</p>
       ) : (
         <ul className="space-y-2">
-          {waitingEntries.map((entry, i) => {
-            const isOwn = entry.createdBy === user?.id
-            return (
+          {queueItems.map((item, i) =>
+            item.kind === 'solo' ? (
               <li
-                key={entry.recordId}
+                key={item.entry.recordId}
                 className="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3"
               >
                 <span className="w-8 shrink-0 text-sm font-medium text-muted-foreground">
                   #{i + 1}
                 </span>
-                <span className="flex-1 text-sm text-foreground">{entry.data.question}</span>
+                <span className="flex-1 text-sm text-foreground">{item.entry.data.question}</span>
                 {isTA ? (
                   <div className="flex shrink-0 gap-1">
                     <Button
                       variant="secondary"
                       size="sm"
-                      onClick={() => handleClaim(entry.recordId)}
+                      onClick={() => handleClaim(item.entry.recordId)}
                       disabled={!ready}
                     >
                       Claim
@@ -135,18 +320,18 @@ function Queue() {
                     <Button
                       variant="secondary"
                       size="sm"
-                      onClick={() => handleResolve(entry.recordId)}
+                      onClick={() => handleResolve(item.entry.recordId)}
                       disabled={!ready}
                     >
                       Resolve
                     </Button>
                   </div>
                 ) : (
-                  isOwn && (
+                  item.entry.createdBy === user?.id && (
                     <Button
                       variant="secondary"
                       size="sm"
-                      onClick={() => remove(entry.recordId)}
+                      onClick={() => remove(item.entry.recordId)}
                       disabled={!ready}
                     >
                       Leave
@@ -154,12 +339,26 @@ function Queue() {
                   )
                 )}
               </li>
-            )
-          })}
+            ) : (
+              <GroupCard
+                key={item.groupId}
+                position={i + 1}
+                entries={item.entries}
+                reason={item.reason}
+                isTA={isTA}
+                currentUserId={user?.id}
+                ready={ready}
+                onClaimGroup={handleClaimGroup}
+                onResolveGroup={handleResolveGroup}
+                onRemoveFromGroup={handleRemoveFromGroup}
+                onLeave={remove}
+              />
+            ),
+          )}
         </ul>
       )}
 
-      {/* TA: claimed entries with Resolve / Requeue */}
+      {/* TA: claimed entries */}
       {isTA && (
         <ClaimedSection
           allEntries={allEntries}
@@ -169,8 +368,150 @@ function Queue() {
         />
       )}
 
-      {/* TA join code form (shown to non-TA signed-in users) */}
+      {/* TA join code form */}
       {!isTA && <TaCodeForm onSuccess={refetchUser} />}
+    </div>
+  )
+}
+
+function GroupCard({
+  position,
+  entries,
+  reason,
+  isTA,
+  currentUserId,
+  ready,
+  onClaimGroup,
+  onResolveGroup,
+  onRemoveFromGroup,
+  onLeave,
+}: {
+  position: number
+  entries: QueueRecord[]
+  reason: string
+  isTA: boolean
+  currentUserId: string | undefined
+  ready: boolean
+  onClaimGroup: (entries: QueueRecord[]) => void
+  onResolveGroup: (entries: QueueRecord[]) => void
+  onRemoveFromGroup: (entryId: string) => void
+  onLeave: (entryId: string) => void
+}) {
+  return (
+    <li className="rounded-lg border border-border bg-card px-4 py-3">
+      <div className="mb-2 flex items-start gap-3">
+        <span className="mt-0.5 w-8 shrink-0 text-sm font-medium text-muted-foreground">
+          #{position}
+        </span>
+        <div className="flex flex-1 flex-wrap items-center justify-between gap-2">
+          <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+            {reason || 'Group'}
+          </span>
+          {isTA && (
+            <div className="flex shrink-0 gap-1">
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => onClaimGroup(entries)}
+                disabled={!ready}
+              >
+                Claim group
+              </Button>
+              <Button
+                variant="secondary"
+                size="sm"
+                onClick={() => onResolveGroup(entries)}
+                disabled={!ready}
+              >
+                Resolve group
+              </Button>
+            </div>
+          )}
+        </div>
+      </div>
+      <ul className="ml-11 space-y-1">
+        {entries.map((e) => (
+          <li key={e.recordId} className="flex items-center gap-2">
+            <span className="flex-1 text-sm text-foreground">{e.data.question}</span>
+            {isTA ? (
+              <Button
+                variant="ghost"
+                size="sm"
+                onClick={() => onRemoveFromGroup(e.recordId)}
+                disabled={!ready}
+              >
+                Remove from group
+              </Button>
+            ) : (
+              e.createdBy === currentUserId && (
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => onLeave(e.recordId)}
+                  disabled={!ready}
+                >
+                  Leave
+                </Button>
+              )
+            )}
+          </li>
+        ))}
+      </ul>
+    </li>
+  )
+}
+
+function SuggestionsPanel({
+  suggestions,
+  allEntries,
+  ready,
+  onConfirm,
+  onDismiss,
+}: {
+  suggestions: SuggestionRecord[]
+  allEntries: QueueRecord[]
+  ready: boolean
+  onConfirm: (s: SuggestionRecord) => void
+  onDismiss: (id: string) => void
+}) {
+  return (
+    <div className="mb-6">
+      <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
+        AI Group Suggestions
+      </h2>
+      <ul className="space-y-3">
+        {suggestions.map((s) => {
+          const ids = parseEntryIds(s.data.entryIds)
+          const entries = ids
+            .map((id) => allEntries.find((e) => e.recordId === id))
+            .filter((e): e is QueueRecord => e !== undefined)
+          return (
+            <li key={s.recordId} className="rounded-lg border border-border bg-card px-4 py-3">
+              <p className="mb-2 text-sm font-medium text-foreground">{s.data.reason}</p>
+              <ul className="mb-3 space-y-1">
+                {entries.map((e) => (
+                  <li key={e.recordId} className="text-xs text-muted-foreground">
+                    — {e.data.question}
+                  </li>
+                ))}
+              </ul>
+              <div className="flex gap-2">
+                <Button size="sm" onClick={() => onConfirm(s)} disabled={!ready}>
+                  Confirm
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onDismiss(s.recordId)}
+                  disabled={!ready}
+                >
+                  Dismiss
+                </Button>
+              </div>
+            </li>
+          )
+        })}
+      </ul>
     </div>
   )
 }
@@ -190,7 +531,7 @@ function ClaimedSection({
   if (claimed.length === 0) return null
   return (
     <div className="mt-8">
-      <h2 className="mb-3 text-sm font-semibold text-muted-foreground uppercase tracking-wide">
+      <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
         Claimed
       </h2>
       <ul className="space-y-2">
@@ -257,7 +598,6 @@ function TaCodeForm({ onSuccess }: { onSuccess: () => Promise<void> }) {
     }
 
     setCode('')
-    // Reset feedback after a moment so repeated attempts don't reveal info
     setTimeout(() => setState('idle'), 2000)
   }
 
