@@ -24,9 +24,8 @@ export const redeemTaCode: ActionHandler<Env> = async ({ userId, params, tools, 
     await tools.create('settings', { key: attemptsKey, value: String(newAttempts) })
   }
 
-  // Rate limit: same generic response as a wrong code — don't reveal the limit was hit
   if (attempts >= MAX_ATTEMPTS) {
-    return { success: false, error: 'invalid_code' }
+    return { success: false, error: 'rate_limited' }
   }
 
   const code = typeof params.code === 'string' ? params.code : ''

@@ -16,6 +16,33 @@
  *   4. Switch to it via `data-theme` on <html> in index.html.
  */
 
+/* OHQ — deep navy with a teal accent. The app's own theme. */
+[data-theme="ohq"] {
+  --color-background: #0a0f1a;
+  --color-foreground: #e2e8f0;
+  --color-card: #131c2e;
+  --color-card-foreground: #e2e8f0;
+  --color-popover: #131c2e;
+  --color-popover-foreground: #e2e8f0;
+  --color-primary: #2dd4bf;
+  --color-primary-foreground: #000;
+  --color-secondary: #1a2540;
+  --color-secondary-foreground: #e2e8f0;
+  --color-muted: #1a2540;
+  --color-muted-foreground: #7c8db0;
+  --color-accent: #1f2d4a;
+  --color-accent-foreground: #e2e8f0;
+  --color-destructive: #ef4444;
+  --color-destructive-foreground: #fff;
+  --color-border: rgba(55, 65, 81, 0.5);
+  --color-input: rgba(55, 65, 81, 0.5);
+  --color-ring: #2dd4bf;
+  --color-shell: #0a0f1a;
+  --color-shell-panel: #131c2e;
+  --shadow-card: 0 1px 3px 0 rgba(0, 0, 0, 0.4);
+  --shadow-card-hover: 0 4px 12px 0 rgba(0, 0, 0, 0.5);
+}
+
 /* Paper — light example theme; shows the full token contract incl.
  * `color-scheme: light`. Replace or delete it once the app has its own. */
 [data-theme="paper"] {

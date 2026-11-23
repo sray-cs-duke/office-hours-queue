@@ -30,6 +30,28 @@ function parseEntryIds(raw: string[] | string): string[] {
   return Array.isArray(raw) ? raw : JSON.parse(raw as string)
 }
 
+function buildGroupedItems(entries: QueueRecord[], groupReasons: Map<string, string>): QueueItem[] {
+  const addedGroups = new Set<string>()
+  const addedEntries = new Set<string>()
+  const items: QueueItem[] = []
+  for (const entry of entries) {
+    if (addedEntries.has(entry.recordId)) continue
+    if (entry.data.groupId) {
+      const gid = entry.data.groupId
+      if (!addedGroups.has(gid)) {
+        addedGroups.add(gid)
+        const members = entries.filter((e) => e.data.groupId === gid)
+        for (const m of members) addedEntries.add(m.recordId)
+        items.push({ kind: 'group', groupId: gid, entries: members, reason: groupReasons.get(gid) ?? '' })
+      }
+    } else {
+      addedEntries.add(entry.recordId)
+      items.push({ kind: 'solo', entry })
+    }
+  }
+  return items
+}
+
 export default function QueuePage() {
   return (
     <AuthGate fallback={<SignInPrompt />}>
@@ -73,6 +95,7 @@ function Queue() {
   const { put: putSuggestion } = useMutations<GroupSuggestionData>('group_suggestions')
 
   const waitingEntries = allEntries.filter((e) => e.data.status === 'waiting')
+  const claimedEntries = allEntries.filter((e) => e.data.status === 'claimed')
   const myEntry = allEntries.find(
     (e) => e.createdBy === user?.id && (e.data.status === 'waiting' || e.data.status === 'claimed'),
   )
@@ -84,25 +107,7 @@ function Queue() {
     if (s.data.status === 'confirmed') groupReasons.set(s.recordId, s.data.reason)
   }
 
-  // Build ordered list of solo entries and group cards
-  const addedGroups = new Set<string>()
-  const addedEntries = new Set<string>()
-  const queueItems: QueueItem[] = []
-  for (const entry of waitingEntries) {
-    if (addedEntries.has(entry.recordId)) continue
-    if (entry.data.groupId) {
-      const gid = entry.data.groupId
-      if (!addedGroups.has(gid)) {
-        addedGroups.add(gid)
-        const members = waitingEntries.filter((e) => e.data.groupId === gid)
-        for (const m of members) addedEntries.add(m.recordId)
-        queueItems.push({ kind: 'group', groupId: gid, entries: members, reason: groupReasons.get(gid) ?? '' })
-      }
-    } else {
-      addedEntries.add(entry.recordId)
-      queueItems.push({ kind: 'solo', entry })
-    }
-  }
+  const queueItems = buildGroupedItems(waitingEntries, groupReasons)
 
   // Student: how many others share their group
   const myGroupOthers =
@@ -112,7 +117,7 @@ function Queue() {
         ).length
       : 0
 
-  // Student join form state
+  // Student join form
   const [question, setQuestion] = useState('')
 
   async function handleJoin(e: React.FormEvent) {
@@ -139,7 +144,7 @@ function Queue() {
     await put(entryId, { status: 'waiting', claimedBy: null, claimedAt: null })
   }
 
-  // TA: group handlers
+  // TA: group handlers (waiting queue)
   async function handleClaimGroup(entries: QueueRecord[]) {
     await Promise.all(
       entries.map((e) =>
@@ -160,6 +165,13 @@ function Queue() {
 
   async function handleRemoveFromGroup(entryId: string) {
     await put(entryId, { groupId: null })
+  }
+
+  // TA: group handlers (claimed section)
+  async function handleRequeueGroup(entries: QueueRecord[]) {
+    await Promise.all(
+      entries.map((e) => put(e.recordId, { status: 'waiting', claimedBy: null, claimedAt: null })),
+    )
   }
 
   // TA: AI suggestions
@@ -184,15 +196,13 @@ function Queue() {
         timeout,
       ])
       const data = (await res.json()) as { success?: boolean; data?: { count?: number }; error?: string }
-      console.log('[suggestGroups UI] response:', data)
       if (data.success && (data.data?.count ?? 0) === 0) {
         setSuggestState('empty')
         setTimeout(() => setSuggestState('idle'), 3000)
       } else {
         setSuggestState('idle')
       }
-    } catch (err) {
-      console.log('[suggestGroups UI] fetch error or timeout:', err)
+    } catch {
       setSuggestState('error')
       setTimeout(() => setSuggestState('idle'), 3000)
     }
@@ -225,7 +235,10 @@ function Queue() {
 
   return (
     <div className="mx-auto max-w-2xl px-6 py-8 text-foreground">
-      <h1 className="mb-6 text-2xl font-semibold">Office Hours Queue</h1>
+      <h1 className="mb-1 text-2xl font-semibold">Office Hours Queue</h1>
+      <p className="mb-6 text-sm text-muted-foreground">
+        Students with the same bug get helped together.
+      </p>
 
       {/* Student: claimed banner */}
       {!isTA && myEntry?.data.status === 'claimed' && (
@@ -294,7 +307,9 @@ function Queue() {
 
       {/* Queue list */}
       {queueItems.length === 0 ? (
-        <p className="text-sm text-muted-foreground">The queue is empty.</p>
+        <p className="text-sm text-muted-foreground">
+          {claimedEntries.length > 0 ? 'No one waiting.' : 'The queue is empty.'}
+        </p>
       ) : (
         <ul className="space-y-2">
           {queueItems.map((item, i) =>
@@ -362,13 +377,16 @@ function Queue() {
       {isTA && (
         <ClaimedSection
           allEntries={allEntries}
+          groupReasons={groupReasons}
           ready={ready}
           onResolve={handleResolve}
           onRequeue={handleRequeue}
+          onResolveGroup={handleResolveGroup}
+          onRequeueGroup={handleRequeueGroup}
         />
       )}
 
-      {/* TA join code form */}
+      {/* TA join code form (hidden once user is a TA) */}
       {!isTA && <TaCodeForm onSuccess={refetchUser} />}
     </div>
   )
@@ -518,49 +536,96 @@ function SuggestionsPanel({
 
 function ClaimedSection({
   allEntries,
+  groupReasons,
   ready,
   onResolve,
   onRequeue,
+  onResolveGroup,
+  onRequeueGroup,
 }: {
-  allEntries: ReturnType<typeof useQuery<QueueEntryData>>['records']
+  allEntries: QueueRecord[]
+  groupReasons: Map<string, string>
   ready: boolean
   onResolve: (id: string) => void
   onRequeue: (id: string) => void
+  onResolveGroup: (entries: QueueRecord[]) => void
+  onRequeueGroup: (entries: QueueRecord[]) => void
 }) {
   const claimed = allEntries.filter((e) => e.data.status === 'claimed')
   if (claimed.length === 0) return null
+
+  const items = buildGroupedItems(claimed, groupReasons)
+
   return (
     <div className="mt-8">
       <h2 className="mb-3 text-sm font-semibold uppercase tracking-wide text-muted-foreground">
         Claimed
       </h2>
       <ul className="space-y-2">
-        {claimed.map((entry) => (
-          <li
-            key={entry.recordId}
-            className="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3"
-          >
-            <span className="flex-1 text-sm text-foreground">{entry.data.question}</span>
-            <div className="flex shrink-0 gap-1">
-              <Button
-                variant="secondary"
-                size="sm"
-                onClick={() => onResolve(entry.recordId)}
-                disabled={!ready}
-              >
-                Resolve
-              </Button>
-              <Button
-                variant="ghost"
-                size="sm"
-                onClick={() => onRequeue(entry.recordId)}
-                disabled={!ready}
-              >
-                Requeue
-              </Button>
-            </div>
-          </li>
-        ))}
+        {items.map((item) =>
+          item.kind === 'solo' ? (
+            <li
+              key={item.entry.recordId}
+              className="flex items-center gap-3 rounded-lg border border-border bg-card px-4 py-3"
+            >
+              <span className="flex-1 text-sm text-foreground">{item.entry.data.question}</span>
+              <div className="flex shrink-0 gap-1">
+                <Button
+                  variant="secondary"
+                  size="sm"
+                  onClick={() => onResolve(item.entry.recordId)}
+                  disabled={!ready}
+                >
+                  Resolve
+                </Button>
+                <Button
+                  variant="ghost"
+                  size="sm"
+                  onClick={() => onRequeue(item.entry.recordId)}
+                  disabled={!ready}
+                >
+                  Requeue
+                </Button>
+              </div>
+            </li>
+          ) : (
+            <li
+              key={item.groupId}
+              className="rounded-lg border border-border bg-card px-4 py-3"
+            >
+              <div className="mb-2 flex items-center justify-between">
+                <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">
+                  {item.reason || 'Group'}
+                </span>
+                <div className="flex shrink-0 gap-1">
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    onClick={() => onResolveGroup(item.entries)}
+                    disabled={!ready}
+                  >
+                    Resolve group
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    onClick={() => onRequeueGroup(item.entries)}
+                    disabled={!ready}
+                  >
+                    Requeue group
+                  </Button>
+                </div>
+              </div>
+              <ul className="space-y-1">
+                {item.entries.map((e) => (
+                  <li key={e.recordId} className="text-sm text-foreground">
+                    — {e.data.question}
+                  </li>
+                ))}
+              </ul>
+            </li>
+          ),
+        )}
       </ul>
     </div>
   )
@@ -568,11 +633,11 @@ function ClaimedSection({
 
 function TaCodeForm({ onSuccess }: { onSuccess: () => Promise<void> }) {
   const [code, setCode] = useState('')
-  const [state, setState] = useState<'idle' | 'loading' | 'done' | 'error'>('idle')
+  const [state, setState] = useState<'idle' | 'loading' | 'submitted' | 'limited'>('idle')
 
   async function handleSubmit(e: React.FormEvent) {
     e.preventDefault()
-    if (!code.trim() || state === 'loading') return
+    if (!code.trim() || state === 'loading' || state === 'limited') return
     setState('loading')
 
     try {
@@ -585,45 +650,53 @@ function TaCodeForm({ onSuccess }: { onSuccess: () => Promise<void> }) {
         },
         body: JSON.stringify({ code: code.trim() }),
       })
-      const data = (await res.json()) as { success?: boolean }
-      if (data.success) {
-        setCode('')
-        await onSuccess()
-        setState('done')
+      const data = (await res.json()) as { success?: boolean; error?: string }
+      if (data.error === 'rate_limited') {
+        setState('limited')
         return
       }
-      setState('error')
-    } catch {
-      setState('error')
-    }
+      if (data.success) {
+        void onSuccess() // role change arrives via WebSocket; don't await
+      }
+    } catch {}
 
+    // Wrong code, success (pre-unmount), or network error — show message briefly
     setCode('')
-    setTimeout(() => setState('idle'), 2000)
+    setState('submitted')
+    setTimeout(() => setState('idle'), 3_000)
   }
-
-  if (state === 'done') return null
 
   return (
     <details className="mt-10">
       <summary className="cursor-pointer text-sm text-muted-foreground hover:text-foreground">
         I&apos;m a TA
       </summary>
-      <form onSubmit={handleSubmit} className="mt-3 flex gap-2">
-        <Input
-          type="password"
-          value={code}
-          onChange={(e) => setCode(e.target.value)}
-          placeholder="Enter TA code"
-          disabled={state === 'loading'}
-          className="flex-1"
-          autoComplete="off"
-        />
-        <Button type="submit" disabled={state === 'loading' || !code.trim()}>
-          {state === 'loading' ? 'Checking…' : 'Submit'}
-        </Button>
-      </form>
-      {state === 'error' && (
-        <p className="mt-2 text-xs text-muted-foreground">Code not recognised.</p>
+      {state === 'limited' ? (
+        <p className="mt-3 text-xs text-muted-foreground">
+          Too many attempts. Ask your instructor for help.
+        </p>
+      ) : (
+        <div className="mt-3">
+          <form onSubmit={handleSubmit} className="flex gap-2">
+            <Input
+              type="password"
+              value={code}
+              onChange={(e) => setCode(e.target.value)}
+              placeholder="Enter TA code"
+              disabled={state === 'loading'}
+              className="flex-1"
+              autoComplete="off"
+            />
+            <Button type="submit" disabled={state === 'loading' || !code.trim()}>
+              {state === 'loading' ? 'Checking…' : 'Submit'}
+            </Button>
+          </form>
+          {state === 'submitted' && (
+            <p className="mt-2 text-xs text-muted-foreground">
+              Code submitted. If it&apos;s valid, TA tools will appear.
+            </p>
+          )}
+        </div>
       )}
     </details>
   )
