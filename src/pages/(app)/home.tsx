@@ -79,8 +79,8 @@ function SignInPrompt() {
 }
 
 function Queue() {
-  const { user, refetch: refetchUser } = useUser()
-  const isTA = user?.role === 'admin'
+  const { user, isLoading: userLoading, refetch: refetchUser } = useUser()
+  const isTA = !userLoading && user !== null && user.role === 'admin'
 
   const { records: allEntries } = useQuery<QueueEntryData>('queue_entries', {
     orderBy: 'createdAt',

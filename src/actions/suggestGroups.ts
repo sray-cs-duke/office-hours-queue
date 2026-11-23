@@ -7,6 +7,8 @@ type AnthropicResponse = { content: Array<{ type: string; text?: string }> }
 
 export const suggestGroups: ActionHandler<Env> = async ({ userId, tools, env }) => {
   const role = await resolveAppRole(env, userId)
+  // TEMP DIAG: remove after confirming root cause
+  console.log('[suggestGroups] caller:', userId, 'server role:', role)
   if (role !== 'admin') {
     return { success: false, error: 'forbidden' }
   }
